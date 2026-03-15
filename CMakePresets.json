@@ -1,0 +1,17 @@
+{
+    "version": 8,
+    "configurePresets": [
+        {
+            "name": "default-debug",
+            "displayName": "Default Debug",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_CXX_COMPILER": "/usr/bin/clang++",
+                "Qt6_DIR": "/opt/homebrew/opt/qtbase/lib/cmake/Qt6",
+                "CMAKE_PREFIX_PATH": "/opt/homebrew/opt/qtbase"
+            }
+        }
+    ]
+}
+
