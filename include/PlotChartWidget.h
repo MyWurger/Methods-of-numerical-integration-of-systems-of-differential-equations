@@ -18,6 +18,11 @@ class InteractiveChartView;
 class PlotChartWidget final : public QFrame
 {
 public:
+    // explicit запрещает неявное создание виджета графика из одного
+    // строкового или иного одиночного аргумента конструктора.
+    //
+    // Для GUI-виджетов это хороший защитный прием:
+    // объект должен создаваться только через явный вызов конструктора.
     explicit PlotChartWidget(const QString& title,
                              const QString& xAxisLabel,
                              const QString& yAxisLabel,
