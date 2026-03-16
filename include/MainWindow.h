@@ -30,8 +30,6 @@
 #include <array>
 // std::function нужен для фабрик создания конкретных интеграторов.
 #include <functional>
-// std::unique_ptr используется для безопасственного владения интегратором.
-#include <memory>
 // std::vector нужен для хранения списка доступных методов интегрирования.
 #include <vector>
 
@@ -74,7 +72,7 @@ struct IntegratorOption
     //
     // На выходе возвращает объект конкретного метода, например Эйлера или
     // Рунге-Кутты 4 порядка.
-    std::function<std::unique_ptr<TAbstractIntegrator>(double t0, double tk, double h)> factory;
+    std::function<TAbstractIntegrator*(double t0, double tk, double h)> factory;
 };
 
 // ----------------------------------------------------------------------------
