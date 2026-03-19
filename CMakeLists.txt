@@ -165,6 +165,9 @@ endif()
 # Без него нельзя собрать графический интерфейс на Qt Widgets.
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
+# Qt Concurrent нужен для запуска длительного моделирования вне GUI-потока.
+find_package(Qt6 REQUIRED COMPONENTS Concurrent)
+
 # Модуль Qt Svg нужен для отображения SVG-ресурсов и для работы
 # соответствующего icon engine.
 find_package(Qt6Svg REQUIRED)
@@ -244,7 +247,7 @@ set_target_properties(
 # Линкуем приложение с теми библиотеками Qt, которые были найдены выше.
 # Иначе на этапе компоновки у целевого файла не будет реализации нужных
 # классов из Widgets, Svg и Charts.
-target_link_libraries(ModelingMethodsLab1 PRIVATE Qt6::Widgets Qt6::Svg Qt6::Charts)
+target_link_libraries(ModelingMethodsLab1 PRIVATE Qt6::Widgets Qt6::Concurrent Qt6::Svg Qt6::Charts)
 
 # Если используемая версия Qt/CMake предоставляет helper-команду
 # qt_finalize_executable(...), вызываем ее.
@@ -272,6 +275,11 @@ if(APPLE)
     # На macOS неподписанный или поврежденный bundle может просто не
     # запускаться.
     find_program(CODESIGN_EXECUTABLE NAMES codesign)
+
+    # install_name_tool нужен для точечной правки install names у dylib-файлов.
+    # В нашем случае он используется, чтобы плагины внутри bundle ссылались
+    # на Qt framework-библиотеки из самого .app, а не на системный/Homebrew Qt.
+    find_program(INSTALL_NAME_TOOL_EXECUTABLE NAMES install_name_tool)
 
     # macdeployqt - это штатная утилита Qt для macOS.
     # Она умеет собрать внутрь .app необходимые Qt framework-библиотеки.
@@ -474,6 +482,23 @@ if(APPLE)
                 "$<TARGET_BUNDLE_DIR:ModelingMethodsLab1>/Contents/PlugIns/iconengines/libqsvgicon.dylib"
             COMMENT "Copying the SVG icon engine plugin into the macOS app bundle"
         )
+
+        # После простого копирования plugin может по-прежнему ссылаться
+        # на QtCore/QtGui из Homebrew. Это приводит к загрузке двух разных
+        # комплектов Qt в один процесс и к предупреждениям objc о дубликатах.
+        #
+        # Ниже точечно переписываем такие зависимости на framework-библиотеки,
+        # уже упакованные внутрь нашего .app bundle.
+        if(INSTALL_NAME_TOOL_EXECUTABLE)
+            add_custom_command(
+                TARGET ModelingMethodsLab1 POST_BUILD
+                COMMAND "${CMAKE_COMMAND}"
+                    -DPLUGIN="$<TARGET_BUNDLE_DIR:ModelingMethodsLab1>/Contents/PlugIns/iconengines/libqsvgicon.dylib"
+                    -DINSTALL_NAME_TOOL_EXECUTABLE="${INSTALL_NAME_TOOL_EXECUTABLE}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/FixQtPluginPaths.cmake"
+                COMMENT "Rewriting SVG icon engine Qt dependencies to the bundled frameworks"
+            )
+        endif()
     endif()
 
     # ----------------------------------------------------------------------------

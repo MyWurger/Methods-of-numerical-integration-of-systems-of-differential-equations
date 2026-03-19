@@ -40,11 +40,6 @@
 // ----------------------------------------------------------------------------
 namespace
 {
-// Верхняя защитная граница на число шагов интегрирования.
-// Она нужна, чтобы программа не ушла в бесконечный или практически
-// бесконечный цикл при некорректных параметрах.
-constexpr std::size_t kSafetyStepLimit = 2'000'000;
-
 // Допуск по времени.
 // Из-за погрешностей double нельзя безусловно полагаться на точное равенство
 // вида currentTime_ == effectiveEndTime, поэтому используется маленький
@@ -227,7 +222,7 @@ SimulationResult TAbstractIntegrator::MoveTo(double tend)
 
         // Сохраняем самую первую точку траектории: текущее время и текущее
         // состояние системы до начала цикла интегрирования.
-        result.samples.push_back({currentTime_, currentState_});
+        result.samples.push_back(MakeSimulationSample(currentTime_, currentState_));
 
         // В этой строке будет возвращено поясняющее сообщение, если модель
         // сообщит, что достигнуто терминальное состояние.
@@ -242,20 +237,11 @@ SimulationResult TAbstractIntegrator::MoveTo(double tend)
             return result;
         }
 
-        // Счетчик реально выполненных шагов.
-        std::size_t steps = 0;
-
         // Основной цикл интегрирования.
         // Идем вперед по времени, пока не приблизимся к effectiveEndTime
         // на расстояние меньше допуска kTimeTolerance.
         while ((effectiveEndTime - currentTime_) > kTimeTolerance)
         {
-            // Защитный выход на случай патологически большого числа шагов.
-            if (steps >= kSafetyStepLimit)
-            {
-                return {false, "Превышен допустимый предел шагов интегрирования", result.samples};
-            }
-
             // Обычно используется базовый шаг h_.
             // Но на последней итерации остаток времени может быть меньше h_.
             // Тогда нужно сделать укороченный последний шаг, чтобы точно
@@ -284,7 +270,7 @@ SimulationResult TAbstractIntegrator::MoveTo(double tend)
             AdvanceTime(integrationStep);
 
             // Сохраняем новую точку траектории.
-            result.samples.push_back({currentTime_, currentState_});
+            result.samples.push_back(MakeSimulationSample(currentTime_, currentState_));
 
             // После каждого шага снова проверяем, не достигнуто ли
             // терминальное состояние.
@@ -294,9 +280,6 @@ SimulationResult TAbstractIntegrator::MoveTo(double tend)
                 result.message = terminalMessage;
                 return result;
             }
-
-            // Увеличиваем счетчик шагов.
-            ++steps;
         }
 
         // Если дошли сюда, значит интегрирование завершилось штатно.

@@ -49,6 +49,9 @@
 // Событие получения/потери фокуса.
 #include <QFocusEvent>
 
+// Наблюдатель за завершением фонового вычисления.
+#include <QFutureWatcher>
+
 // Табличный компоновщик для размещения карточек графиков.
 #include <QGridLayout>
 
@@ -104,6 +107,9 @@
 // QTextDocument используется для rich-text отрисовки HTML-заголовков таблицы.
 #include <QTextDocument>
 
+// QtConcurrent::run нужен для запуска расчета вне GUI-потока.
+#include <QtConcurrent/QtConcurrentRun>
+
 // QTimer нужен для отложенного обновления некоторых элементов интерфейса.
 #include <QTimer>
 
@@ -132,6 +138,17 @@
 // ----------------------------------------------------------------------------
 namespace
 {
+// Верхняя граница на число точек, которые реально передаются в один график.
+// Полный результат при этом остается в lastResult_ и таблице.
+constexpr int kMaxPlotSourcePoints = 50000;
+
+// Максимальное число строк, которое одновременно показывается в экранной таблице.
+constexpr int kMaxTablePreviewRows = 100000;
+
+// Максимальное число строк, которое экспортируется в PNG без чрезмерного
+// роста изображения.
+constexpr int kMaxTableExportRows = 5000;
+
 // ----------------------------------------------------------------------------
 // КЛАСС MethodComboBox
 // ----------------------------------------------------------------------------
@@ -282,7 +299,8 @@ protected:
 // Принимает:
 // - state - вектор состояния [x, y, z, Vx, Vy, Vz].
 // ----------------------------------------------------------------------------
-double Radius(const TVector& state)
+template <typename TState>
+double Radius(const TState& state)
 {
     // Формула модуля радиус-вектора:
     // r = sqrt(x^2 + y^2 + z^2)
@@ -299,11 +317,51 @@ double Radius(const TVector& state)
 // Принимает:
 // - state - вектор состояния [x, y, z, Vx, Vy, Vz].
 // ----------------------------------------------------------------------------
-double Speed(const TVector& state)
+template <typename TState>
+double Speed(const TState& state)
 {
     // Формула модуля скорости:
     // |V| = sqrt(Vx^2 + Vy^2 + Vz^2)
     return std::sqrt(state[3] * state[3] + state[4] * state[4] + state[5] * state[5]);
+}
+
+std::size_t PlotSamplingStep(std::size_t sampleCount)
+{
+    if (sampleCount <= static_cast<std::size_t>(kMaxPlotSourcePoints))
+    {
+        return 1;
+    }
+
+    return (sampleCount - 1) / static_cast<std::size_t>(kMaxPlotSourcePoints - 1) + 1;
+}
+
+template <typename XGetter, typename YGetter>
+QVector<QPointF> BuildPlotSeries(const std::vector<SimulationSample>& samples, XGetter xGetter, YGetter yGetter)
+{
+    QVector<QPointF> points;
+    if (samples.empty())
+    {
+        return points;
+    }
+
+    const std::size_t step = PlotSamplingStep(samples.size());
+    const std::size_t estimatedCount = (samples.size() - 1) / step + 1;
+    points.reserve(static_cast<int>(estimatedCount + 1));
+
+    for (std::size_t index = 0; index < samples.size(); index += step)
+    {
+        const auto& sample = samples[index];
+        points.append(QPointF(xGetter(sample), yGetter(sample)));
+    }
+
+    const auto& lastSample = samples.back();
+    const QPointF lastPoint(xGetter(lastSample), yGetter(lastSample));
+    if (points.isEmpty() || points.back() != lastPoint)
+    {
+        points.append(lastPoint);
+    }
+
+    return points;
 }
 
 // ----------------------------------------------------------------------------
@@ -403,14 +461,32 @@ public:
     // Передать модели новый результат моделирования, который затем будет
     // отображаться в таблице.
     // ----------------------------------------------------------------------------
-    void SetResult(const SimulationResult* result)
+    void SetResult(const SimulationResult* result, int maxVisibleRows = -1)
     {
         // beginResetModel() / endResetModel() - стандартная пара методов Qt
         // Model/View, которая сообщает представлению, что модель будет
         // полностью пересобрана.
         beginResetModel();
         result_ = result;
+        rowStep_ = 1;
+
+        if (result_ != nullptr && maxVisibleRows > 0 &&
+            result_->samples.size() > static_cast<std::size_t>(maxVisibleRows))
+        {
+            rowStep_ =
+                (result_->samples.size() - 1) / static_cast<std::size_t>(maxVisibleRows - 1) + 1;
+        }
         endResetModel();
+    }
+
+    bool IsSampled() const noexcept
+    {
+        return rowStep_ > 1;
+    }
+
+    std::size_t VisibleRowStep() const noexcept
+    {
+        return rowStep_;
     }
 
     // ----------------------------------------------------------------------------
@@ -437,9 +513,9 @@ public:
             return 0;
         }
 
-        // size() возвращает число сохраненных выборок траектории.
-        // static_cast<int>(...) нужен, потому что size() возвращает size_t.
-        return static_cast<int>(result_->samples.size());
+        const std::size_t sampleCount = result_->samples.size();
+        const std::size_t visibleRows = (sampleCount - 1) / rowStep_ + 1;
+        return static_cast<int>(visibleRows);
     }
 
     // ----------------------------------------------------------------------------
@@ -481,13 +557,16 @@ public:
         // Если индекс некорректен, результата нет или номер строки выходит
         // за границы, возвращаем пустой QVariant.
         if (!index.isValid() || result_ == nullptr || index.row() < 0 ||
-            index.row() >= static_cast<int>(result_->samples.size()))
+            index.row() >= rowCount())
         {
             return {};
         }
 
         // Получаем выборку, соответствующую строке таблицы.
-        const SimulationSample& sample = result_->samples[static_cast<std::size_t>(index.row())];
+        const std::size_t sampleIndex = std::min(
+            static_cast<std::size_t>(index.row()) * rowStep_,
+            result_->samples.size() - static_cast<std::size_t>(1));
+        const SimulationSample& sample = result_->samples[sampleIndex];
 
         // Role в Qt Model/View определяет, какую именно информацию запросило
         // представление: текст, выравнивание, цвет и т.д.
@@ -595,6 +674,9 @@ public:
 private:
     // Указатель на текущий результат моделирования, который отображает модель.
     const SimulationResult* result_ = nullptr;
+
+    // Шаг прореживания строк для визуального представления таблицы.
+    std::size_t rowStep_ = 1;
 };
 
 // ----------------------------------------------------------------------------
@@ -1065,6 +1147,7 @@ MainWindow::MainWindow(std::vector<IntegratorOption> integratorOptions, QWidget*
     // По шагам подготавливаем окно к работе.
     BuildUi();
     ApplyTheme();
+    simulationWatcher_ = new QFutureWatcher<SimulationResult>(this);
     SetupSignals();
     ResetOutputs();
     ShowStatus("Готово к моделированию", true);
@@ -2048,6 +2131,13 @@ void MainWindow::SetupSignals()
         }
     });
 
+    if (simulationWatcher_ != nullptr)
+    {
+        connect(simulationWatcher_, &QFutureWatcher<SimulationResult>::finished, this, [this]() {
+            FinishSimulation(simulationWatcher_->result());
+        });
+    }
+
     // Собираем все числовые поля ввода в один массив, чтобы не писать
     // одинаковый connect вручную для каждого поля по отдельности.
     const std::array<QDoubleSpinBox*, 9> fields = {
@@ -2144,6 +2234,11 @@ void MainWindow::ResetOutputs()
 // ----------------------------------------------------------------------------
 void MainWindow::RunSimulation()
 {
+    if (isSimulationRunning_)
+    {
+        return;
+    }
+
     // Перед новым расчетом обязательно очищаем старые данные из интерфейса.
     ResetOutputs();
 
@@ -2156,10 +2251,6 @@ void MainWindow::RunSimulation()
         ShowStatus(errorMessage, false);
         return;
     }
-
-    // Указатель на интегратор объявляем заранее, чтобы в случае исключения
-    // его можно было удалить в catch.
-    TAbstractIntegrator* integrator = nullptr;
 
     try
     {
@@ -2189,95 +2280,42 @@ void MainWindow::RunSimulation()
             return;
         }
 
-        // Фабрика выбранного варианта создает конкретный объект интегратора:
-        // либо Эйлера, либо Рунге-Кутты 4 порядка.
-        integrator = integratorOptions_[static_cast<std::size_t>(methodIndex)].factory(t0, tk, h);
+        const auto factory = integratorOptions_[static_cast<std::size_t>(methodIndex)].factory;
+        const TSpaceCraft model = spaceCraftModel_;
 
-        // Если фабрика по какой-то причине вернула nullptr, продолжать нельзя.
-        if (integrator == nullptr)
-        {
-            ShowStatus("Не удалось создать выбранный интегратор.", false);
-            return;
-        }
+        ApplySimulationRunningState(true);
+        ShowStatus("Идёт моделирование. Интерфейс остаётся доступным, результат появится после завершения расчёта.", true);
 
-        // Передаем интегратору модель правых частей движения КА.
-        integrator->SetRightParts(spaceCraftModel_);
+        simulationWatcher_->setFuture(QtConcurrent::run([factory, model, x, y, z, vx, vy, vz, t0, tk, h]() -> SimulationResult {
+            TAbstractIntegrator* integrator = nullptr;
 
-        // Устанавливаем начальный вектор состояния:
-        // x, y, z, Vx, Vy, Vz.
-        integrator->SetInitialState({x, y, z, vx, vy, vz});
-
-        // Запускаем интегрирование до терминального момента времени tk.
-        const SimulationResult result = integrator->MoveTo(tk);
-
-        // Интегратор больше не нужен, поэтому удаляем его сразу после расчета.
-        delete integrator;
-        integrator = nullptr;
-
-        // Если интегратор сообщил неуспех и при этом не вернул ни одной точки,
-        // пользователю показываем только сообщение об ошибке.
-        if (!result.success && result.samples.empty())
-        {
-            ShowStatus(QString::fromStdString(result.message), false);
-            return;
-        }
-
-        // Сохраняем результат в поле класса для дальнейшего использования
-        // таблицей, графиками и экспортом.
-        lastResult_ = result;
-
-        // Помечаем, что валидный результат уже существует.
-        hasResult_ = true;
-
-        // Заполняем табличное представление.
-        PopulateTable(result);
-
-        // Обновляем итоговую сводку по количеству точек, времени, радиусу и скорости.
-        UpdateSummary(result);
-
-        // Обновляем текущую видимую вкладку результатов.
-        RefreshVisibleResults();
-
-        // Дополнительное отложенное обновление через очередь событий Qt.
-        // Оно нужно, чтобы графики корректно появились даже если вкладка
-        // только что была очищена и layout еще не завершил перестройку.
-        QTimer::singleShot(0, this, [this]() {
-            if (hasResult_)
+            try
             {
-                RefreshVisibleResults();
+                integrator = factory(t0, tk, h);
+                if (integrator == nullptr)
+                {
+                    return {false, "Не удалось создать выбранный интегратор.", {}};
+                }
+
+                integrator->SetRightParts(model);
+                integrator->SetInitialState({x, y, z, vx, vy, vz});
+
+                const SimulationResult result = integrator->MoveTo(tk);
+                delete integrator;
+                return result;
             }
-        });
-
-        // Экспорт разрешаем только если есть хотя бы одна рассчитанная точка.
-        exportTableButton_->setEnabled(!result.samples.empty());
-
-        // success=true означает, что расчет завершился штатно.
-        if (result.success)
-        {
-            ShowStatus("Моделирование завершено успешно. Данные готовы для построения графиков.", true);
-        }
-
-        // recoverable-результат означает, что расчет мог остановиться раньше
-        // нормы, но уже накопленные данные все равно полезны пользователю.
-        else if (IsRecoverableResult(result))
-        {
-            ShowStatus(QString::fromStdString(result.message), false);
-        }
-
-        // Все остальные неуспешные исходы также показываем через статус.
-        else
-        {
-            ShowStatus(QString::fromStdString(result.message), false);
-        }
+            catch (const std::exception& ex)
+            {
+                delete integrator;
+                return {false, ex.what(), {}};
+            }
+        }));
     }
 
     // std::exception - базовый класс стандартных исключений C++.
     // Сюда попадают ошибки валидации, вычислений, создания объектов и т.д.
     catch (const std::exception& ex)
     {
-        // Если исключение произошло до ручного delete, очищаем интегратор здесь.
-        delete integrator;
-
         // what() возвращает C-строку с описанием ошибки. fromUtf8(...)
         // переводит ее в QString для показа в интерфейсе.
         ShowStatus(QString("Ошибка: %1").arg(QString::fromUtf8(ex.what())), false);
@@ -2366,15 +2404,6 @@ bool MainWindow::ValidateInput(QString& errorMessage) const
         return false;
     }
 
-    // Защитное ограничение на число шагов.
-    // Если шагов будет слишком много, приложение может начать заметно
-    // тормозить или потреблять слишком много памяти.
-    if (((tk - t0) / h) > 500000.0)
-    {
-        errorMessage = "Слишком много шагов интегрирования. Увеличь h или уменьши tk.";
-        return false;
-    }
-
     // Если x = y = z = 0, начальный радиус-вектор нулевой, а в модели
     // центрального поля это приводит к физически и численно некорректной
     // постановке задачи.
@@ -2417,7 +2446,7 @@ void MainWindow::RefreshRunButtonState()
     if (runButton_ != nullptr)
     {
         // setEnabled(true/false) включает или отключает кнопку.
-        runButton_->setEnabled(allFilled);
+        runButton_->setEnabled(allFilled && !isSimulationRunning_);
     }
 }
 
@@ -2442,10 +2471,95 @@ void MainWindow::PopulateTable(const SimulationResult& result)
     Q_UNUSED(result);
 
     // Передаем модели адрес последнего сохраненного результата.
-    static_cast<SimulationTableModel*>(samplesModel_)->SetResult(&lastResult_);
+    // Для очень больших расчетов таблица показывает не все строки подряд,
+    // а равномерную выборку по всему диапазону траектории.
+    static_cast<SimulationTableModel*>(samplesModel_)->SetResult(&lastResult_, kMaxTablePreviewRows);
 
     // Снова разрешаем обновления таблицы.
     samplesTable_->setUpdatesEnabled(true);
+}
+
+void MainWindow::ApplySimulationRunningState(bool running)
+{
+    isSimulationRunning_ = running;
+
+    const std::array<QDoubleSpinBox*, 9> fields = {
+        xEdit_, yEdit_, zEdit_, vxEdit_, vyEdit_, vzEdit_, t0Edit_, tkEdit_, hEdit_};
+
+    for (auto* field : fields)
+    {
+        if (field != nullptr)
+        {
+            field->setEnabled(!running);
+        }
+    }
+
+    if (methodComboBox_ != nullptr)
+    {
+        methodComboBox_->setEnabled(!running);
+    }
+
+    if (runButton_ != nullptr)
+    {
+        runButton_->setText(running ? "Идёт моделирование..." : "Выполнить моделирование");
+    }
+
+    if (exportTableButton_ != nullptr)
+    {
+        exportTableButton_->setEnabled(!running && hasResult_ && !lastResult_.samples.empty());
+    }
+
+    RefreshRunButtonState();
+}
+
+void MainWindow::FinishSimulation(const SimulationResult& result)
+{
+    ApplySimulationRunningState(false);
+
+    if (!result.success && result.samples.empty())
+    {
+        ShowStatus(QString::fromStdString(result.message), false);
+        return;
+    }
+
+    lastResult_ = result;
+    hasResult_ = true;
+    PopulateTable(result);
+    UpdateSummary(result);
+    RefreshVisibleResults();
+    QTimer::singleShot(0, this, [this]() {
+        if (hasResult_)
+        {
+            RefreshVisibleResults();
+        }
+    });
+
+    if (exportTableButton_ != nullptr)
+    {
+        exportTableButton_->setEnabled(!result.samples.empty());
+    }
+
+    const auto* tableModel = static_cast<SimulationTableModel*>(samplesModel_);
+    const bool sampledTable = tableModel != nullptr && tableModel->IsSampled();
+
+    if (result.success)
+    {
+        if (sampledTable)
+        {
+            ShowStatus(
+                QString("Моделирование завершено. Для таблицы включена равномерная выборка: каждая %1-я строка.")
+                    .arg(tableModel->VisibleRowStep()),
+                true);
+        }
+        else
+        {
+            ShowStatus("Моделирование завершено успешно. Данные готовы для построения графиков.", true);
+        }
+    }
+    else
+    {
+        ShowStatus(QString::fromStdString(result.message), false);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2491,11 +2605,6 @@ void MainWindow::ExportTablePng()
     exportLayout->setContentsMargins(18, 18, 18, 18);
     exportLayout->setSpacing(10);
 
-    // Заголовок экспортируемой таблицы.
-    auto* exportTitle = new QLabel("Таблица траектории", &exportCard);
-    exportTitle->setObjectName("tableTitle");
-    exportLayout->addWidget(exportTitle);
-
     // Создаем отдельную таблицу специально для экспорта, чтобы не зависеть
     // от текущего состояния видимой таблицы на экране.
     auto* exportTable = new QTableView(&exportCard);
@@ -2503,9 +2612,17 @@ void MainWindow::ExportTablePng()
     // Отдельная модель данных для экспортной таблицы.
     auto* exportModel = new SimulationTableModel(exportTable);
 
-    // Передаем модели рассчитанный результат.
-    exportModel->SetResult(&lastResult_);
+    // Для PNG используем отдельную равномерную выборку строк.
+    exportModel->SetResult(&lastResult_, kMaxTableExportRows);
     exportTable->setModel(exportModel);
+
+    const bool sampledExport = exportModel->IsSampled();
+
+    // Заголовок экспортируемой таблицы.
+    auto* exportTitle = new QLabel(
+        sampledExport ? "Таблица траектории (равномерная выборка)" : "Таблица траектории", &exportCard);
+    exportTitle->setObjectName("tableTitle");
+    exportLayout->addWidget(exportTitle);
 
     // Ставим тот же rich-text заголовок, что и в основной таблице.
     exportTable->setHorizontalHeader(new RichTextHeaderView(Qt::Horizontal, exportTable));
@@ -2591,7 +2708,18 @@ void MainWindow::ExportTablePng()
     }
 
     // Сообщаем пользователю, куда именно был сохранен PNG.
-    ShowStatus(QString("PNG таблицы сохранён: %1").arg(filePath), true);
+    if (sampledExport)
+    {
+        ShowStatus(
+            QString("PNG таблицы сохранён: %1. Для экспорта использована равномерная выборка: каждая %2-я строка.")
+                .arg(filePath)
+                .arg(exportModel->VisibleRowStep()),
+            true);
+    }
+    else
+    {
+        ShowStatus(QString("PNG таблицы сохранён: %1").arg(filePath), true);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2641,67 +2769,6 @@ void MainWindow::UpdatePlots(const SimulationResult& result)
         return;
     }
 
-    // QVector<QPointF> - это контейнер Qt для набора двумерных точек.
-    // Именно в таком виде PlotChartWidget ожидает входные данные.
-    //
-    // Для координатных графиков по оси X откладывается время t,
-    // а по оси Y - соответствующая координата.
-    QVector<QPointF> xSeries;
-    QVector<QPointF> ySeries;
-    QVector<QPointF> zSeries;
-
-    // Для графиков скоростей по оси X также идет время t,
-    // а по оси Y - компонента скорости.
-    QVector<QPointF> vxSeries;
-    QVector<QPointF> vySeries;
-    QVector<QPointF> vzSeries;
-
-    // Для пространственных проекций обе координаты берутся уже не из времени,
-    // а из самого вектора состояния.
-    QVector<QPointF> xySeries;
-    QVector<QPointF> yzSeries;
-    QVector<QPointF> xzSeries;
-
-    // Количество сэмплов заранее известно, поэтому полезно сразу зарезервировать
-    // память под все векторы, чтобы уменьшить число реаллокаций.
-    const int count = static_cast<int>(result.samples.size());
-    xSeries.reserve(count);
-    ySeries.reserve(count);
-    zSeries.reserve(count);
-    vxSeries.reserve(count);
-    vySeries.reserve(count);
-    vzSeries.reserve(count);
-    xySeries.reserve(count);
-    yzSeries.reserve(count);
-    xzSeries.reserve(count);
-
-    // Последовательно разворачиваем каждый SimulationSample в несколько
-    // различных представлений для разных графиков.
-    for (const auto& sample : result.samples)
-    {
-        // sample.time - момент времени данного сэмпла.
-        // sample.state[0], [1], [2] - это x, y, z.
-        //
-        // append(...) добавляет новую точку в конец соответствующего QVector.
-        // Графики координат во времени.
-        xSeries.append(QPointF(sample.time, sample.state[0]));
-        ySeries.append(QPointF(sample.time, sample.state[1]));
-        zSeries.append(QPointF(sample.time, sample.state[2]));
-
-        // sample.state[3], [4], [5] - это Vx, Vy, Vz.
-        // Графики скоростей во времени.
-        vxSeries.append(QPointF(sample.time, sample.state[3]));
-        vySeries.append(QPointF(sample.time, sample.state[4]));
-        vzSeries.append(QPointF(sample.time, sample.state[5]));
-
-        // Здесь время уже не используется.
-        // Для XY берутся координаты (x, y), для YZ - (y, z), для XZ - (x, z).
-        // Пространственные проекции траектории.
-        xySeries.append(QPointF(sample.state[0], sample.state[1]));
-        yzSeries.append(QPointF(sample.state[1], sample.state[2]));
-        xzSeries.append(QPointF(sample.state[0], sample.state[2]));
-    }
-
     // Определяем, закончился ли расчет остановкой по столкновению.
     // contains(..., Qt::CaseInsensitive) ищет слово "столкновение" без учета регистра.
     const bool hasCollisionStop = (!result.success && !result.samples.empty() &&
@@ -2722,6 +2789,16 @@ void MainWindow::UpdatePlots(const SimulationResult& result)
     const int tabIndex = resultsTabs_ != nullptr ? resultsTabs_->currentIndex() : 0;
     if (tabIndex == 0)
     {
+        const QVector<QPointF> xSeries = BuildPlotSeries(
+            result.samples, [](const SimulationSample& sample) { return sample.time; },
+            [](const SimulationSample& sample) { return sample.state[0]; });
+        const QVector<QPointF> ySeries = BuildPlotSeries(
+            result.samples, [](const SimulationSample& sample) { return sample.time; },
+            [](const SimulationSample& sample) { return sample.state[1]; });
+        const QVector<QPointF> zSeries = BuildPlotSeries(
+            result.samples, [](const SimulationSample& sample) { return sample.time; },
+            [](const SimulationSample& sample) { return sample.state[2]; });
+
         // Вкладка координат: передаем графикам серии X(t), Y(t), Z(t).
         coordinatePlots_[0]->SetData(xSeries);
         coordinatePlots_[1]->SetData(ySeries);
@@ -2745,6 +2822,16 @@ void MainWindow::UpdatePlots(const SimulationResult& result)
     }
     else if (tabIndex == 1)
     {
+        const QVector<QPointF> vxSeries = BuildPlotSeries(
+            result.samples, [](const SimulationSample& sample) { return sample.time; },
+            [](const SimulationSample& sample) { return sample.state[3]; });
+        const QVector<QPointF> vySeries = BuildPlotSeries(
+            result.samples, [](const SimulationSample& sample) { return sample.time; },
+            [](const SimulationSample& sample) { return sample.state[4]; });
+        const QVector<QPointF> vzSeries = BuildPlotSeries(
+            result.samples, [](const SimulationSample& sample) { return sample.time; },
+            [](const SimulationSample& sample) { return sample.state[5]; });
+
         // Вкладка скоростей: передаем графикам серии Vx(t), Vy(t), Vz(t).
         velocityPlots_[0]->SetData(vxSeries);
         velocityPlots_[1]->SetData(vySeries);
@@ -2760,6 +2847,16 @@ void MainWindow::UpdatePlots(const SimulationResult& result)
     }
     else if (tabIndex == 2)
     {
+        const QVector<QPointF> xySeries = BuildPlotSeries(
+            result.samples, [](const SimulationSample& sample) { return sample.state[0]; },
+            [](const SimulationSample& sample) { return sample.state[1]; });
+        const QVector<QPointF> yzSeries = BuildPlotSeries(
+            result.samples, [](const SimulationSample& sample) { return sample.state[1]; },
+            [](const SimulationSample& sample) { return sample.state[2]; });
+        const QVector<QPointF> xzSeries = BuildPlotSeries(
+            result.samples, [](const SimulationSample& sample) { return sample.state[0]; },
+            [](const SimulationSample& sample) { return sample.state[2]; });
+
         // Вкладка траекторий: передаем пространственные проекции XY, YZ, XZ.
         trajectoryPlots_[0]->SetData(xySeries);
         trajectoryPlots_[1]->SetData(yzSeries);

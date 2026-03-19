@@ -37,6 +37,9 @@
 class QComboBox;
 // Предварительное объявление QDoubleSpinBox для всех числовых полей ввода.
 class QDoubleSpinBox;
+// Предварительное объявление QFutureWatcher для фонового расчета.
+template <typename T>
+class QFutureWatcher;
 // Предварительное объявление QLabel для текстовых подписей и итоговых значений.
 class QLabel;
 // Предварительное объявление QPushButton для кнопок окна.
@@ -151,6 +154,12 @@ private:
     // Передает рассчитанные данные в модель таблицы.
     void PopulateTable(const SimulationResult& result);
 
+    // Применяет режим "идет расчет" или обычный режим к элементам интерфейса.
+    void ApplySimulationRunningState(bool running);
+
+    // Завершает цикл обработки результата после фонового моделирования.
+    void FinishSimulation(const SimulationResult& result);
+
     // Обновляет сводную панель:
     // - число точек;
     // - финальное время;
@@ -244,4 +253,10 @@ private:
 
     // Признак того, что в окне уже есть актуальный результат.
     bool hasResult_ = false;
+
+    // Признак того, что моделирование сейчас выполняется в фоне.
+    bool isSimulationRunning_ = false;
+
+    // Наблюдатель за фоновым вычислением результата.
+    QFutureWatcher<SimulationResult>* simulationWatcher_ = nullptr;
 };
